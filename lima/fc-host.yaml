@@ -1,0 +1,13 @@
+base: template:ubuntu-24.04
+vmType: vz
+nestedVirtualization: true
+cpus: 4
+memory: 8GiB
+disk: 60GiB
+containerd:
+  system: false
+  user: false
+mountType: virtiofs
+mounts:
+  - location: "~/Documents/vm-performance-repro"
+    writable: true

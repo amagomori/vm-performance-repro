@@ -1,0 +1,13 @@
+[project]
+name = "vm-performance-repro"
+version = "0.1.0"
+description = "Local experiments for Firecracker sandbox hosts: reflink disks, memory snapshots and a Floci-emulated AWS control plane."
+requires-python = ">=3.12"
+dependencies = [
+    "aws-cdk-lib==2.237.0",
+    "boto3>=1.40",
+    "constructs>=10.4",
+]
+
+[tool.uv]
+package = false
