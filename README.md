@@ -2,6 +2,8 @@
 
 Measures how much faster a Firecracker microVM starts from a memory snapshot than from a cold boot, and how much memory and disk the forks of one snapshot share. Disks are copied with XFS reflinks, the method Cognition describes for Devin's VMs, and AWS is emulated locally with [Floci](https://github.com/floci-io/floci).
 
+![Architecture: bench.py drives Firecracker VMs inside a Lima VM on the Mac, using an XFS reflink cache for disks and snapshots, while Terraform and boto3 checks run against Floci in Docker](docs/architecture.png)
+
 ## What the benchmark does
 
 1. **Cold path:** boots a VM from a reflink copy of a base disk, then runs a task setup that fills 200 MB of guest RAM and waits 5 s.
@@ -113,6 +115,7 @@ The control-plane pieces (S3, DynamoDB, SQS, EventBridge) are a Terraform stack 
 | `aws/main.tf` | Terraform stack: S3 bucket, DynamoDB table, SQS queue and an EventBridge rule into the queue |
 | `aws/check.py` | boto3 checks against the stack's Terraform outputs |
 | `.env` | Floci settings and workarounds |
+| `docs/architecture.png` | The diagram above, drawn in Paper |
 
 ## Known limitations
 
