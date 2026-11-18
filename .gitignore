@@ -1,4 +1,5 @@
 .venv/
 __pycache__/
-floci/cdk.out/
-floci/outputs.json
+aws/.terraform/
+aws/terraform.tfstate
+aws/terraform.tfstate.backup

@@ -13,7 +13,7 @@ Measures how much faster a Firecracker microVM starts from a memory snapshot tha
 ## Requirements
 
 - An Apple silicon Mac with an M3 or newer chip on macOS 15 or later, for nested virtualization. A Linux host with `/dev/kvm` also works.
-- [Lima](https://lima-vm.io), [Docker](https://www.docker.com), [uv](https://docs.astral.sh/uv/) and the [AWS CDK CLI](https://docs.aws.amazon.com/cdk/v2/guide/cli.html).
+- [Lima](https://lima-vm.io), [Docker](https://www.docker.com), [uv](https://docs.astral.sh/uv/) and [Terraform](https://developer.hashicorp.com/terraform/install) 1.6 or later.
 - The Lima config mounts `~/Documents/vm-performance-repro`. Clone the repo there, or change `location` in `lima/fc-host.yaml`.
 
 ## Run the benchmark
@@ -71,7 +71,7 @@ Firecracker v1.18.0 on an M4 Mac with 16 GB of RAM, inside a Lima VM with nested
 
 ## Local AWS with Floci
 
-The control-plane pieces (S3, DynamoDB, SQS, EventBridge) run against Floci, a free AWS emulator. `.env` holds its settings and explains each macOS workaround.
+The control-plane pieces (S3, DynamoDB, SQS, EventBridge) are a Terraform stack in `aws/`, applied to Floci, a free AWS emulator. The provider block has nothing Floci-specific: `.env` points the AWS SDKs and Terraform at Floci and explains each macOS workaround. Without `.env`, the same stack applies to real AWS.
 
 1. Start Floci:
 
@@ -79,15 +79,27 @@ The control-plane pieces (S3, DynamoDB, SQS, EventBridge) run against Floci, a f
    docker run -d --name floci -p 127.0.0.1:4566:4566 floci/floci:2.5.0
    ```
 
-2. Deploy the test stack and run the checks:
+2. Load the settings and apply the stack:
 
    ```bash
-   uv sync && set -a && . ./.env && set +a && cd floci && cdk bootstrap aws://000000000000/us-east-1 && cdk deploy FlociCheck --require-approval never --outputs-file outputs.json && uv run python check.py
+   set -a && . ./.env && set +a && terraform -chdir=aws init && terraform -chdir=aws apply -auto-approve
+   ```
+
+3. Run the checks:
+
+   ```bash
+   uv run python aws/check.py
+   ```
+
+4. Remove the stack:
+
+   ```bash
+   terraform -chdir=aws destroy -auto-approve
    ```
 
 | Check | Result |
 |---|---|
-| S3: upload and download 8 MiB | Passes, about 250 ms |
+| S3: upload and download 8 MiB | Passes, about 170 ms |
 | DynamoDB: two conditional READY → CLAIMED writes on one item | Passes: the first wins, the second gets `ConditionalCheckFailedException` |
 | EventBridge rule into SQS | Passes: RUNNING and STOPPED arrive, PENDING is filtered out |
 
@@ -98,7 +110,8 @@ The control-plane pieces (S3, DynamoDB, SQS, EventBridge) run against Floci, a f
 | `bench.py` | Runs the cold path, snapshot and forks, then prints the results table |
 | `host-setup.sh` | Prepares a Firecracker host. Set `FC_DEVICE` to use a real disk, such as EC2 NVMe, instead of a loop file. |
 | `lima/fc-host.yaml` | Ubuntu 24.04 VM with nested virtualization |
-| `floci/` | CDK test stack and boto3 checks for the emulated AWS services |
+| `aws/main.tf` | Terraform stack: S3 bucket, DynamoDB table, SQS queue and an EventBridge rule into the queue |
+| `aws/check.py` | boto3 checks against the stack's Terraform outputs |
 | `.env` | Floci settings and workarounds |
 
 ## Known limitations
@@ -106,4 +119,4 @@ The control-plane pieces (S3, DynamoDB, SQS, EventBridge) run against Floci, a f
 - Firecracker 1.18.0 can't point a restored drive at a new file during snapshot load. `bench.py` loads the snapshot paused, repoints the drive with `PATCH /drives`, then resumes.
 - Disk checkpoints with `blockdiff` aren't wired in yet.
 - Snapshots taken on Arm don't predict Intel hosts, and a snapshot resumes only on the CPU model that made it.
-- The CDK tooling warns that Node 20 is past end of life. It still works, and Node 22 or 24 removes the warning.
+- `terraform init` downloads the AWS provider, about 730 MB unpacked, into `aws/.terraform/`.
