@@ -27,6 +27,12 @@ It repeats these steps and reports the median and range across runs.
 4. **Snapshot:** pauses the warm VM and saves every memory page touched since boot.
 5. **Concurrent forks:** starts 1, 8 and 16 forks at once by default, each on its own reflink disk, and runs the same command in each. It reports wall time, the median and slowest restore and command, and host memory per fork.
 
+With `--service`, the snapshot holds a running app instead:
+
+- **Image:** FastAPI and uvicorn are layered on the task image, with a small app that imports the same libraries and loads the task's CSV at startup.
+- **Snapshot:** the cold VM starts the app and waits until `/health` answers, so the app is already listening in every fork.
+- **Forks:** each fork sends one `GET /stats` to that app from inside the guest, so no fork needs a network.
+
 ## Requirements
 
 - An Apple silicon Mac with an M3 or newer chip on macOS 15 or later, for nested virtualization. A Linux host with `/dev/kvm` also works.
@@ -166,8 +172,36 @@ Task `modernize-scientific-stack` at commit `2fd12b8`, in guests with the task's
 - **Nesting costs on first touch:** each memory page a fork reads for the first time is a page fault. Under nesting, the outer hypervisor handles that fault too, so a single nested fork takes 1.7 s against 659 ms warm in the cold VM. 64 nested forks on 16 vCPUs take 15.6 s.
 - **Memory per fork:** each fork adds 80 to 98 MiB of host memory, measured as the drop in `MemAvailable`. That is mostly the new Python process's own memory. The snapshot itself is shared, so CPU runs out before memory does.
 - **Disk:** the task's own layer is about 880 MiB on a shared base of about 195 MiB, and forks add almost no disk.
-- **What the snapshot saves:** each command here starts a new Python process, so a fork skips the boot and gets a warm page cache, but repeats the imports. Snapshots save more when the setup leaves something running, like a service or a warm interpreter.
+- **What the snapshot saves:** each command here starts a new Python process, so a fork skips the boot and gets a warm page cache, but repeats the imports. Snapshots save more when the setup leaves something running, as the `--service` results below show.
 - **On the Mac:** use EC2 for `task-forks`. Under Lima, one fork's first command took 14.8 s against 2.2 s warm, and 8 forks at once didn't finish within 10 minutes.
+
+### With `--service`: forks of a running FastAPI app
+
+Same task, hosts and settings. The snapshot is taken with the app already started, and each fork sends it one request.
+
+| Step | `c8i.4xlarge`: x86_64, nested | `c8g.metal-24xl`: arm64, bare metal |
+|---|---|---|
+| Cold boot to a shell | 1.3 s | 169 ms |
+| Start the app and wait until `/health` answers | 2.4 s | 1.2 s |
+| First request in the cold VM | 20 ms | 10 ms |
+| Snapshot of the VM with the app running | 1.7 s | 1.7 s |
+| Memory file (sparse, of 2048 MiB) | 318 MiB | 318 MiB |
+
+| Forks started at once | 1 | 16 | 64 |
+|---|---|---|---|
+| **`c8i.4xlarge`: all forks answered** | **239 ms** | **902 ms** | **3.8 s** |
+| Restore, median / slowest | 3 ms / 3 ms | 6 ms / 12 ms | 26 ms / 48 ms |
+| First request, median / slowest | 222 ms / 222 ms | 740 ms / 769 ms | 2.0 s / 2.9 s |
+| Host memory per fork | 7.4 MiB | 12 MiB | 13 MiB |
+| **`c8g.metal-24xl`: all forks answered** | **46 ms** | **137 ms** | **446 ms** |
+| Restore, median / slowest | 4 ms / 4 ms | 4 ms / 5 ms | 4 ms / 6 ms |
+| First request, median / slowest | 30 ms / 30 ms | 40 ms / 40 ms | 40 ms / 41 ms |
+| Host memory per fork | 4.6 MiB | 12 MiB | 10 MiB |
+
+- **The app is already running:** a fork answers in 30 ms on bare metal against 1.4 s to boot, start the app and answer cold. Nothing starts in the fork: uvicorn resumes where it was paused, with its imports and data in memory.
+- **64 copies of a running app:** on bare metal all 64 answer within 446 ms. On 16 nested vCPUs they take 3.8 s, because each fork still pays the nested cost the first time it touches each page.
+- **Memory per fork drops to about 12 MiB:** forks share the app's whole memory and only copy the pages they change. With a new Python process per command, each fork cost 80 to 98 MiB.
+- **What a real service would still need:** a fork keeps the app's open connections, secrets and random state from snapshot time. See the limitation on per-fork identity below.
 
 ## Local AWS with Floci
 
@@ -226,4 +260,4 @@ The control-plane pieces (S3, DynamoDB, SQS, EventBridge) are a Terraform stack 
 - [`CognitionAI/blockdiff`](https://github.com/CognitionAI/blockdiff) has no license file, so this repo doesn't include its code. `host-setup.sh` builds it from GitHub at a pinned commit. Using it beyond this experiment needs Cognition's permission or a rewrite.
 - Diff memory snapshots are in Firecracker's developer preview, so their behavior may change between releases. Dirty page tracking also slows guest memory writes and cancels most of the benefit of huge pages.
 - A snapshot resumes only on the CPU model that made it, so a fleet needs one set of snapshots per host type.
-- Forks have no network, and they start with the same hostname and process state. Per-fork networking and identity aren't tested yet.
+- Forks have no network, and they start with the same hostname, open connections, secrets and random state as the snapshot. Per-fork networking and identity aren't tested yet.

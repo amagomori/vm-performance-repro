@@ -14,6 +14,7 @@ HELP = "Build a real task image into a VM disk, snapshot it warm, and start many
 TASKS_REPO = "https://github.com/harbor-framework/terminal-bench-2"
 TASKS_REV = "2fd12b88aafdd04a52c298e3940bcb189f9766d6"
 IMAGE = "vmrepro-task"
+SERVICE_IMAGE = "vmrepro-service"
 INIT = """#!/bin/sh
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -24,12 +25,54 @@ mount -t tmpfs tmpfs /dev/shm
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
 hostname task
+ip link set lo up 2>/dev/null
 export HOME=/root PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin PS1='root@task:~# '
 cd /app 2>/dev/null
 exec /bin/sh -i </dev/ttyS0 >/dev/ttyS0 2>&1
 """
-WORKLOAD = ("python3 -c \"import numpy, pandas, scipy.stats, matplotlib; "
-            "print(pandas.read_csv('climate_analyzer/sample_data/climate_data.csv').describe().shape)\"")
+SERVICE_DOCKERFILE = f"""FROM {IMAGE}
+RUN pip install --no-cache-dir fastapi==0.162.0 pydantic==2.14.1 uvicorn==0.54.0 \\
+    && apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
+COPY service.py /app/service.py
+"""
+SERVICE_APP = """import json
+
+import matplotlib
+import numpy
+import pandas
+import scipy.stats
+from fastapi import FastAPI
+
+data = pandas.read_csv("climate_analyzer/sample_data/climate_data.csv")
+app = FastAPI()
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/stats")
+def stats():
+    return json.loads(data.describe().to_json())
+"""
+
+
+@dataclass(frozen=True)
+class Workload:
+    noun: str
+    detail: str
+    setup: str | None
+    text: str
+
+
+COMMAND = Workload("command", "imports + read the CSV", None,
+                   "python3 -c \"import numpy, pandas, scipy.stats, matplotlib; "
+                   "print(pandas.read_csv('climate_analyzer/sample_data/climate_data.csv').describe().shape)\"")
+REQUEST = Workload("request", "GET /stats from the running FastAPI app",
+                   "uvicorn service:app --port 8000 >/tmp/app.log 2>&1 & "
+                   "until curl -sf localhost:8000/health >/dev/null; do sleep 0.05; done",
+                   "curl -sf localhost:8000/stats >/dev/null")
 
 
 @dataclass(frozen=True)
@@ -68,10 +111,19 @@ def export(image, dest):
         run("docker", "rm", container)
 
 
-def build_disks(task, work):
+def build_disks(task, work, workload):
     m = {}
     m["Build the task image from its Dockerfile"] = ("s", run("docker", "build", "-q", "-t", IMAGE,
                                                               task.folder / "environment"))
+    image = IMAGE
+    if workload.setup:
+        context = work / "service"
+        context.mkdir(exist_ok=True)
+        (context / "Dockerfile").write_text(SERVICE_DOCKERFILE)
+        (context / "service.py").write_text(SERVICE_APP)
+        m["Add FastAPI, uvicorn and the app on top"] = ("s", run("docker", "build", "-q", "-t", SERVICE_IMAGE,
+                                                                 context))
+        image = SERVICE_IMAGE
     base_disk, task_disk, mnt = work / "base.ext4", work / "task.ext4", work / "mnt"
     export(task.base_image, work / "base")
     (work / "base" / "vm-init").write_text(INIT)
@@ -81,7 +133,7 @@ def build_disks(task, work):
     run("mkfs.ext4", "-q", "-F", "-d", work / "base", base_disk)
     m[f"Shared base disk from {task.base_image} (allocated)"] = ("MiB", allocated_mib(base_disk))
 
-    export(IMAGE, work / "image")
+    export(image, work / "image")
     task_disk.unlink(missing_ok=True)
     reflink(base_disk, task_disk)
     mnt.mkdir(exist_ok=True)
@@ -97,15 +149,15 @@ def build_disks(task, work):
     return m, task_disk
 
 
-def command(vm, i):
+def command(vm, text, i):
     with Stopwatch() as watch:
-        vm.send(f"{WORKLOAD} && echo DONE-$((0+{i}))\n")
+        vm.send(f"{text} && echo DONE-$((0+{i}))\n")
         vm.wait_for(rf"\nDONE-{i}\r?\n", timeout=600)
     vm.wait_for(r"# ")
     return watch.seconds
 
 
-def cold_path(cache, task, disk, snap):
+def cold_path(cache, task, disk, snap, workload):
     m = {}
     src = VM(cache.vms / "task-source")
     reflink(disk, src.disk)
@@ -113,8 +165,10 @@ def cold_path(cache, task, disk, snap):
     with Stopwatch() as boot:
         src.start(task.guest)
     m["Cold boot to a shell"] = ("s", boot.seconds)
-    m["First command in the cold VM: imports + read the CSV"] = ("s", command(src, 1))
-    m["Same command again in the cold VM, cache warm"] = ("s", command(src, 2))
+    if workload.setup:
+        m["Start the app and wait until /health answers"] = ("s", command(src, workload.setup, 1))
+    m[f"First {workload.noun} in the cold VM: {workload.detail}"] = ("s", command(src, workload.text, 2))
+    m[f"Same {workload.noun} again in the cold VM, warm"] = ("s", command(src, workload.text, 3))
     with Stopwatch() as snapshot:
         src.pause()
         src.snapshot("Diff", snap / "vmstate", snap / "mem")
@@ -125,35 +179,35 @@ def cold_path(cache, task, disk, snap):
     return m
 
 
-def fork(cache, snap, i):
+def fork(cache, snap, workload, i):
     vm = VM(cache.vms / f"task-fork-{i}")
     reflink(snap / "disk.ext4", vm.disk)
     with Stopwatch() as restore:
         vm.restore(snap / "vmstate", snap / "mem")
-    return vm, restore.seconds, command(vm, i)
+    return vm, restore.seconds, command(vm, workload.text, i)
 
 
 def mem_available_mib():
     return int(re.search(r"^MemAvailable:\s+(\d+) kB", Path("/proc/meminfo").read_text(), re.M).group(1)) / 1024
 
 
-def fork_level(cache, snap, n):
+def fork_level(cache, snap, workload, n):
     for old in cache.vms.glob("task-fork-*"):
         shutil.rmtree(old)
     before = mem_available_mib()
     with Stopwatch() as wall:
         with ThreadPoolExecutor(n) as pool:
-            vms, restores, commands = zip(*pool.map(functools.partial(fork, cache, snap), range(1, n + 1)))
+            vms, restores, commands = zip(*pool.map(functools.partial(fork, cache, snap, workload), range(1, n + 1)))
     used = before - mem_available_mib()
     pss = sum(vm.mem_mib()["Pss"] for vm in vms)
     for vm in vms:
         vm.kill()
     return {
-        "Start all forks and answer one command each": ("s", wall.seconds),
+        f"Start all forks and answer one {workload.noun} each": ("s", wall.seconds),
         "Restore, median": ("s", statistics.median(restores)),
         "Restore, slowest": ("s", max(restores)),
-        "First command, median": ("s", statistics.median(commands)),
-        "First command, slowest": ("s", max(commands)),
+        f"First {workload.noun}, median": ("s", statistics.median(commands)),
+        f"First {workload.noun}, slowest": ("s", max(commands)),
         "Host memory per fork (PSS)": ("MiB", pss / n),
         "Host memory per fork (drop in MemAvailable)": ("MiB", used / n),
     }
@@ -162,6 +216,8 @@ def fork_level(cache, snap, n):
 def configure(parser):
     parser.add_argument("--task", default="modernize-scientific-stack", help="Terminal-Bench 2.0 task folder name.")
     parser.add_argument("--forks", default="1,8,16", help="Comma-separated numbers of forks to start at once.")
+    parser.add_argument("--service", action="store_true",
+                        help="Snapshot a running FastAPI app, and send it one request from each fork.")
 
 
 def main(args, cache):
@@ -170,12 +226,13 @@ def main(args, cache):
     shutil.rmtree(snap, ignore_errors=True)
     snap.mkdir(parents=True)
     task = Task.fetch(args.task, work / "tasks")
-    rows, disk = build_disks(task, work)
-    rows |= cold_path(cache, task, disk, snap)
+    workload = REQUEST if args.service else COMMAND
+    rows, disk = build_disks(task, work, workload)
+    rows |= cold_path(cache, task, disk, snap, workload)
     levels = [int(n) for n in args.forks.split(",")]
-    results = {n: fork_level(cache, snap, n) for n in levels}
+    results = {n: fork_level(cache, snap, workload, n) for n in levels}
 
-    print(f"\n{environment(task.guest)} · task {task.name}@{TASKS_REV[:7]}\n")
+    print(f"\n{environment(task.guest)} · task {task.name}@{TASKS_REV[:7]} · each fork sends one {workload.noun}\n")
     print("| Step | Result |\n|---|---|")
     for name, (unit, value) in rows.items():
         print(f"| {name} | {fmt(unit, value)} |")
