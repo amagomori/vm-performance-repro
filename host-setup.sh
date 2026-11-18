@@ -5,12 +5,13 @@ FC_VERSION="${FC_VERSION:-v1.18.0}"
 FC_ROOT="${FC_ROOT:-/srv/fc}"
 FC_DEVICE="${FC_DEVICE:-}"
 FC_LOOP_SIZE="${FC_LOOP_SIZE:-40G}"
+BLOCKDIFF_REV="${BLOCKDIFF_REV:-8d10a60bfb31a9dd773843395e9ab3d7bb6dff9c}"
 HOST_USER="${SUDO_USER:-${HOST_USER:-root}}"
 ARCH="$(uname -m)"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq xfsprogs squashfs-tools e2fsprogs jq curl acl python3 >/dev/null
+apt-get install -y -qq xfsprogs squashfs-tools e2fsprogs jq curl acl python3 cargo >/dev/null
 
 usermod -aG kvm "$HOST_USER"
 setfacl -m "u:${HOST_USER}:rw" /dev/kvm
@@ -43,6 +44,11 @@ if ! command -v firecracker >/dev/null || ! firecracker --version | grep -q "${F
   rm -rf "$tmp"
 fi
 
+if [ "$(cat /usr/local/share/blockdiff.rev 2>/dev/null)" != "$BLOCKDIFF_REV" ]; then
+  cargo install --quiet --locked --root /usr/local --git https://github.com/CognitionAI/blockdiff --rev "$BLOCKDIFF_REV"
+  mkdir -p /usr/local/share && echo "$BLOCKDIFF_REV" > /usr/local/share/blockdiff.rev
+fi
+
 base="$FC_ROOT/base"
 if [ ! -f "$base/rootfs.ext4" ]; then
   S3="https://s3.amazonaws.com/spec.ccfc.min"
@@ -65,5 +71,6 @@ if [ ! -f "$base/rootfs.ext4" ]; then
 fi
 
 echo "firecracker: $(firecracker --version | head -1)"
+echo "blockdiff: CognitionAI/blockdiff@${BLOCKDIFF_REV:0:7}"
 echo "cache: $FC_ROOT on $(findmnt -no SOURCE "$FC_ROOT") (reflink on)"
 echo "base: $(cat "$base/SOURCES" | tr '\n' ' ')"

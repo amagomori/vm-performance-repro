@@ -6,9 +6,11 @@ Measures how much faster a Firecracker microVM starts from a memory snapshot tha
 
 ## What the benchmark does
 
-1. **Cold path:** boots a VM from a reflink copy of a base disk, then runs a task setup that fills 200 MB of guest RAM and waits 5 s.
-2. **Snapshot:** pauses the set-up VM, saves its memory and CPU state, and reflinks its disk.
-3. **Forks:** resumes several VMs from that one snapshot, each on its own reflink disk copy with memory mapped copy-on-write. Each fork must answer a command and find the setup's marker file.
+1. **Cold path:** boots a VM from a reflink copy of a base disk, then runs a task setup that writes 50 MB to disk, fills 200 MB of guest RAM and waits 5 s.
+2. **Snapshot:** pauses the set-up VM and saves its memory and CPU state.
+3. **Disk checkpoint:** `blockdiff create` stores only the disk blocks that differ from the base disk. That `.bdiff` file is what a fleet would keep in S3.
+4. **Stage:** `blockdiff apply` rebuilds the full disk from the base plus the diff, as a host would once per task. A SHA-256 check confirms it matches the source disk byte for byte.
+5. **Forks:** resumes several VMs from the one snapshot, each on its own reflink copy of the staged disk with memory mapped copy-on-write. Each fork must answer a command and find the setup's marker file.
 
 `bench.py` repeats this and reports the median and range across runs.
 
@@ -28,7 +30,7 @@ Run every command from the repo root.
    limactl create --name=fc-host lima/fc-host.yaml && limactl start fc-host
    ```
 
-2. Install Firecracker, the XFS reflink cache, and the base kernel and disk:
+2. Install Firecracker, `blockdiff`, the XFS reflink cache, and the base kernel and disk:
 
    ```bash
    limactl shell fc-host -- sudo ./host-setup.sh
@@ -48,28 +50,31 @@ Run every command from the repo root.
 
 ## Results
 
-Firecracker v1.18.0 on an M4 Mac with 16 GB of RAM, inside a Lima VM with nested virtualization, 4 vCPUs and 8 GiB. Guests have 1 vCPU and 512 MiB. Median and range across 3 runs of 5 forks.
+Firecracker v1.18.0 and `blockdiff` at commit `8d10a60`, on an M4 Mac with 16 GB of RAM, inside a Lima VM with nested virtualization, 4 vCPUs and 8 GiB. Guests have 1 vCPU and 512 MiB. Median and range across 3 runs of 5 forks. The staged disk matched the source disk byte for byte in 3 of 3 runs.
 
 | Step | Median | Range |
 |---|---|---|
-| Reflink copy of the 1 GiB base disk | 1 ms | 1 ms – 1 ms |
-| Cold boot to a root shell | 9.3 s | 8.9 s – 9.4 s |
-| Task setup (fill 200 MB of RAM, wait 5 s) | 7.3 s | 7.2 s – 7.3 s |
-| **Cold path total (boot + setup)** | **16.4 s** | 16.2 s – 16.7 s |
-| Memory of the set-up VM (RSS) | 307 MiB | 307 MiB – 307 MiB |
-| Pause + full snapshot (512 MiB guest) | 975 ms | 753 ms – 1.6 s |
-| Reflink the paused disk into the snapshot | 4 ms | 2 ms – 11 ms |
-| Fork: reflink disk copy | 1 ms | 1 ms – 1 ms |
-| Fork: snapshot load + resume | 2 ms | 2 ms – 2 ms |
-| **Fork: resume to first command answered** | **365 ms** | 284 ms – 367 ms |
-| Memory of 5 forks (RSS, total) | 294 MiB | 275 MiB – 306 MiB |
-| **Memory of 5 forks (PSS, total)** | **71 MiB** | 68 MiB – 74 MiB |
-| Extra cache disk used by 5 forks | ≈ 0 MiB | ≈ 0 MiB – ≈ 0 MiB |
+| Reflink copy of the 1 GiB base disk | 1 ms | 1 ms – 3 ms |
+| Cold boot to a root shell | 11.6 s | 11.0 s – 11.7 s |
+| Task setup (50 MB to disk, 200 MB to RAM, wait 5 s) | 8.2 s | 8.2 s – 8.9 s |
+| **Cold path total (boot + setup)** | **19.8 s** | 19.8 s – 19.9 s |
+| Memory of the set-up VM (RSS) | 357 MiB | 356 MiB – 358 MiB |
+| Pause + full snapshot (512 MiB guest) | 2.2 s | 2.0 s – 2.9 s |
+| Disk checkpoint: `blockdiff create` | 7 ms | 6 ms – 8 ms |
+| **Disk checkpoint size (the full disk is 1024 MiB)** | **51 MiB** | 51 MiB – 51 MiB |
+| Stage on a host: `blockdiff apply` onto the base | 2 ms | 2 ms – 2 ms |
+| Fork: reflink disk copy | 2 ms | 2 ms – 3 ms |
+| Fork: snapshot load + resume | 4 ms | 3 ms – 4 ms |
+| **Fork: resume to first command answered** | **357 ms** | 347 ms – 391 ms |
+| Memory of 5 forks (RSS, total) | 280 MiB | 272 MiB – 289 MiB |
+| **Memory of 5 forks (PSS, total)** | **67 MiB** | 66 MiB – 70 MiB |
+| Extra cache disk used by 5 forks | 172 KiB | 140 KiB – 172 KiB |
 
-- **Start time:** a fork answers in 365 ms against 16.4 s for boot plus setup, about 45× faster, and it skips the setup entirely.
-- **Memory:** five forks hold 71 MiB of their own memory in total (PSS), against 307 MiB for one cold VM after setup. Forks share snapshot pages until they write to them.
-- **Disk:** a reflink copy of a 1 GiB disk takes 1 ms, and five forks add no measurable disk.
-- **Caveat:** these numbers come from nested virtualization on a Mac. They show the method works, not how fast an EC2 host would be.
+- **Start time:** a fork answers in 357 ms against 19.8 s for boot plus setup, about 55× faster, and it skips the setup entirely.
+- **Memory:** five forks hold 67 MiB of their own memory in total (PSS), against 357 MiB for one cold VM after setup. Forks share snapshot pages until they write to them.
+- **Disk checkpoint:** the diff is 51 MiB against a 1024 MiB disk, about 5% of it, because only the setup's 50 MB of writes changed. That's what a host would download from S3 per task.
+- **Disk speed:** `create` and `apply` take milliseconds because, on the same XFS filesystem, they clone blocks instead of copying them. On a real host, the cost of staging is downloading the diff.
+- **Caveat:** these numbers come from nested virtualization on a Mac. They show the method works, not how fast an EC2 host would be. Cold boot also varies between sessions on the Mac: an earlier run measured 9.3 s.
 
 ## Local AWS with Floci
 
@@ -109,8 +114,8 @@ The control-plane pieces (S3, DynamoDB, SQS, EventBridge) are a Terraform stack 
 
 | Path | Purpose |
 |---|---|
-| `bench.py` | Runs the cold path, snapshot and forks, then prints the results table |
-| `host-setup.sh` | Prepares a Firecracker host. Set `FC_DEVICE` to use a real disk, such as EC2 NVMe, instead of a loop file. |
+| `bench.py` | Runs the cold path, snapshot, disk checkpoint, stage and forks, then prints the results table |
+| `host-setup.sh` | Prepares a Firecracker host and builds `blockdiff`. Set `FC_DEVICE` to use a real disk, such as EC2 NVMe, instead of a loop file. |
 | `lima/fc-host.yaml` | Ubuntu 24.04 VM with nested virtualization |
 | `aws/main.tf` | Terraform stack: S3 bucket, DynamoDB table, SQS queue and an EventBridge rule into the queue |
 | `aws/check.py` | boto3 checks against the stack's Terraform outputs |
@@ -120,6 +125,7 @@ The control-plane pieces (S3, DynamoDB, SQS, EventBridge) are a Terraform stack 
 ## Known limitations
 
 - Firecracker 1.18.0 can't point a restored drive at a new file during snapshot load. `bench.py` loads the snapshot paused, repoints the drive with `PATCH /drives`, then resumes.
-- Disk checkpoints with `blockdiff` aren't wired in yet.
+- [`CognitionAI/blockdiff`](https://github.com/CognitionAI/blockdiff) has no license file, so this repo doesn't include its code. `host-setup.sh` builds it from GitHub at a pinned commit. Using it beyond this experiment needs Cognition's permission or a rewrite.
+- `blockdiff` covers disks only. The 512 MiB memory file stays a full snapshot, because Firecracker's incremental memory snapshots are still in developer preview.
 - Snapshots taken on Arm don't predict Intel hosts, and a snapshot resumes only on the CPU model that made it.
 - `terraform init` downloads the AWS provider, about 730 MB unpacked, into `aws/.terraform/`.

@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -18,7 +19,8 @@ SNAPS = ROOT / "snapshots"
 BOOT_ARGS = "keep_bootcon console=ttyS0 reboot=k panic=1"
 MEM_MIB = 512
 SETUP = (
-    "dd if=/dev/urandom of=/dev/shm/state bs=1M count=200 status=none"
+    "dd if=/dev/urandom of=/root/deps.bin bs=1M count=50 status=none && sync"
+    " && dd if=/dev/urandom of=/dev/shm/state bs=1M count=200 status=none"
     " && sleep 5 && date +%s > /root/setup-done && echo SETUP-DONE"
 )
 
@@ -92,6 +94,20 @@ def reflink(src, dst):
     return time.perf_counter() - t
 
 
+def blockdiff(*args):
+    t = time.perf_counter()
+    subprocess.run(["blockdiff", *map(str, args)], check=True, capture_output=True)
+    return time.perf_counter() - t
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(16 * 2**20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def disk_used_mib():
     out = subprocess.run(["df", "-B1", "--output=used", str(ROOT)], capture_output=True, text=True, check=True).stdout
     return int(out.split()[-1]) / 2**20
@@ -115,7 +131,7 @@ def run_once(forks):
     setup = time.perf_counter() - t
     src.wait_for(r"# ")
     m["Cold boot to a root shell"] = ("s", boot)
-    m["Task setup (fill 200 MB of RAM, wait 5 s)"] = ("s", setup)
+    m["Task setup (50 MB to disk, 200 MB to RAM, wait 5 s)"] = ("s", setup)
     m["Cold path total (boot + setup)"] = ("s", boot + setup)
     m["Memory of the set-up VM (RSS)"] = ("MiB", src.mem_mib()["Rss"])
 
@@ -127,8 +143,13 @@ def run_once(forks):
     src.api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": str(snap / "vmstate"),
                                          "mem_file_path": str(snap / "mem")})
     m[f"Pause + full snapshot ({MEM_MIB} MiB guest)"] = ("s", time.perf_counter() - t)
-    m["Reflink the paused disk into the snapshot"] = ("s", reflink(src.dir / "rootfs.ext4", snap / "disk.ext4"))
     src.kill()
+    m["Disk checkpoint: blockdiff create"] = ("s", blockdiff("create", snap / "disk.bdiff", src.dir / "rootfs.ext4",
+                                                             "--base", BASE / "rootfs.ext4"))
+    m["Disk checkpoint size (the full disk is 1024 MiB)"] = ("MiB", (snap / "disk.bdiff").stat().st_size / 2**20)
+    m["Stage on a host: blockdiff apply onto the base"] = ("s", blockdiff("apply", snap / "disk.bdiff", snap / "disk.ext4",
+                                                                          "--base", BASE / "rootfs.ext4"))
+    verified = sha256(snap / "disk.ext4") == sha256(src.dir / "rootfs.ext4")
 
     for old in VMS.glob("fork-*"):
         shutil.rmtree(old)
@@ -159,12 +180,16 @@ def run_once(forks):
     m[f"Extra cache disk used by {forks} forks"] = ("MiB", disk_used_mib() - used_before)
     for vm, *_ in resumed:
         vm.kill()
-    return m
+    return m, verified
 
 
 def fmt(unit, value):
     if unit == "MiB":
-        return "≈ 0 MiB" if abs(value) < 1.5 else f"{value:.0f} MiB"
+        if value < 0:
+            return "≈ 0 MiB"
+        if value < 1:
+            return f"{value * 1024:.0f} KiB"
+        return f"{value:.1f} MiB" if value < 10 else f"{value:.0f} MiB"
     return f"{value * 1000:.0f} ms" if value < 1 else f"{value:.1f} s"
 
 
@@ -179,10 +204,14 @@ def main():
     parser.add_argument("--runs", type=int, default=3, help="Full runs to take the median over.")
     args = parser.parse_args()
     runs = []
+    matches = 0
     for i in range(args.runs):
-        runs.append(run_once(args.forks))
+        metrics, verified = run_once(args.forks)
+        runs.append(metrics)
+        matches += verified
         print(f"run {i + 1}/{args.runs} done", flush=True)
-    print(f"\n{environment()} · {args.runs} runs · median and range across runs\n")
+    print(f"\n{environment()} · {args.runs} runs · median and range across runs")
+    print(f"Staged disk matches the source disk byte for byte (SHA-256) in {matches}/{args.runs} runs\n")
     print("| Step | Median | Range |\n|---|---|---|")
     for name, (unit, _) in runs[0].items():
         values = [r[name][1] for r in runs]
