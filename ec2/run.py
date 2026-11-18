@@ -1,5 +1,6 @@
 import argparse
 import shlex
+import signal
 import sys
 import time
 import uuid
@@ -13,6 +14,8 @@ HERE = Path(__file__).resolve().parent
 AWS = Config(signature_version="s3v4", ignore_configured_endpoint_urls=True)
 DEFAULT_TYPES = {"arm64": "c8g.metal-24xl", "x86_64": "c8i.xlarge"}
 AMI_PARAM = "/aws/service/canonical/ubuntu/server/24.04/stable/current/{}/hvm/ebs-gp3/ami-id"
+NAME = "vm-performance-repro"
+BUCKET_PREFIX = "vmrepro-ec2-"
 
 
 @dataclass(frozen=True)
@@ -45,20 +48,22 @@ class Host:
         return cls(instance_type, arch, nested, subnet["SubnetId"], subnet["AvailabilityZone"], ami,
                    ec2.describe_images(ImageIds=[ami])["Images"][0]["RootDeviceName"])
 
-    def launch(self, ec2, user_data):
+    def launch(self, ec2, user_data, expires):
+        tags = [{"Key": "Name", "Value": NAME}, {"Key": "expires", "Value": str(expires)}]
         return ec2.run_instances(
             ImageId=self.ami, InstanceType=self.instance_type, MinCount=1, MaxCount=1, SubnetId=self.subnet,
             UserData=user_data, InstanceInitiatedShutdownBehavior="terminate",
-            BlockDeviceMappings=[{"DeviceName": self.root_device, "Ebs": {"VolumeSize": 60, "VolumeType": "gp3"}}],
-            TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "vm-performance-repro"}]}],
+            BlockDeviceMappings=[{"DeviceName": self.root_device,
+                                  "Ebs": {"VolumeSize": 60, "VolumeType": "gp3", "DeleteOnTermination": True}}],
+            TagSpecifications=[{"ResourceType": kind, "Tags": tags} for kind in ("instance", "volume")],
             **({"CpuOptions": {"NestedVirtualization": "enabled"}} if self.nested else {}),
         )["Instances"][0]["InstanceId"]
 
 
 class ScratchBucket:
-    def __init__(self, minutes):
-        self.bucket = boto3.resource("s3", config=AWS).Bucket(f"vmrepro-ec2-{uuid.uuid4().hex[:12]}")
-        self.expires = minutes * 60
+    def __init__(self, expires):
+        self.bucket = boto3.resource("s3", config=AWS).Bucket(f"{BUCKET_PREFIX}{expires}-{uuid.uuid4().hex[:8]}")
+        self.expires = expires
 
     def __enter__(self):
         region = self.bucket.meta.client.meta.region_name
@@ -72,7 +77,7 @@ class ScratchBucket:
 
     def url(self, method, key):
         return self.bucket.meta.client.generate_presigned_url(
-            method, Params={"Bucket": self.bucket.name, "Key": key}, ExpiresIn=self.expires)
+            method, Params={"Bucket": self.bucket.name, "Key": key}, ExpiresIn=self.expires - int(time.time()))
 
     def upload(self, path):
         self.bucket.upload_file(str(path), path.name)
@@ -83,6 +88,27 @@ class ScratchBucket:
 
     def read(self, key):
         return self.bucket.Object(key).get()["Body"].read().decode()
+
+
+def sweep(ec2):
+    now = time.time()
+    leftovers = ec2.describe_instances(Filters=[
+        {"Name": "tag:Name", "Values": [NAME]},
+        {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
+    ])["Reservations"]
+    for instance in (i for r in leftovers for i in r["Instances"]):
+        if int(next((t["Value"] for t in instance["Tags"] if t["Key"] == "expires"), 0)) < now:
+            ec2.terminate_instances(InstanceIds=[instance["InstanceId"]])
+            print(f"Terminated expired host {instance['InstanceId']}")
+    for bucket in boto3.resource("s3", config=AWS).buckets.filter(Prefix=BUCKET_PREFIX):
+        if int(bucket.name.removeprefix(BUCKET_PREFIX).split("-")[0]) < now:
+            bucket.objects.all().delete()
+            bucket.delete()
+            print(f"Deleted expired bucket {bucket.name}")
+
+
+def stop(signum, frame):
+    sys.exit(f"Stopped by signal {signum}")
 
 
 def user_data(files, timeout, bench_args):
@@ -120,10 +146,14 @@ def main():
     parser.add_argument("--timeout", type=int, default=30, help="Minutes before the host shuts down and terminates.")
     args, bench_args = parser.parse_known_args()
 
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, stop)
     ec2 = boto3.client("ec2", config=AWS)
+    sweep(ec2)
     host = Host.lookup(ec2, args.instance_type or DEFAULT_TYPES[args.arch])
-    with ScratchBucket(args.timeout + 30) as files:
-        instance = host.launch(ec2, user_data(files, args.timeout, bench_args))
+    expires = int(time.time()) + (args.timeout + 30) * 60
+    with ScratchBucket(expires) as files:
+        instance = host.launch(ec2, user_data(files, args.timeout, bench_args), expires)
         print(f"{instance}: {host.instance_type} ({host.arch}) in {host.zone}", flush=True)
         try:
             wait_for_log(ec2, instance, files, args.timeout + 15)

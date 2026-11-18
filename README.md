@@ -68,8 +68,9 @@ AWS_PROFILE=your-profile uv run python ec2/run.py --arch x86_64
 - **What it needs:** a default VPC with internet access, and permission to use EC2, S3 and SSM parameters.
 - **Other hosts:** pass `--instance-type` instead of `--arch` with any `.metal` type, or any type with nested virtualization.
 - **Benchmark options:** other arguments, such as `--forks 10`, go to `bench.py`.
-- **No leftovers:** files move through a temporary S3 bucket with presigned URLs, so the host needs no IAM role or open port. The script deletes the bucket and terminates the host when it ends.
-- **Cost guard:** the host shuts itself down and terminates after `--timeout` minutes (30 by default), even if the script dies.
+- **Temporary resources only:** each run makes one host, its disk and one S3 bucket, and nothing else. Files move through the bucket with presigned URLs, so the host needs no IAM role or open port.
+- **Normal cleanup:** when the script ends, including on Ctrl-C or `kill`, it terminates the host and deletes the bucket. The disk is deleted with the host.
+- **If the script dies:** the host shuts itself down and terminates after `--timeout` minutes (30 by default). The host and bucket also carry an expiry, and every run first removes any expired ones an earlier run left behind.
 
 ## Results
 
