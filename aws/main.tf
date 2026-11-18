@@ -9,8 +9,6 @@ terraform {
   }
 }
 
-provider "aws" {}
-
 resource "aws_s3_bucket" "snapshots" {
   bucket_prefix = "vmrepro-snapshots-"
   force_destroy = true
@@ -59,14 +57,10 @@ resource "aws_sqs_queue_policy" "allow_events" {
   })
 }
 
-output "bucket" {
-  value = aws_s3_bucket.snapshots.bucket
-}
-
-output "table" {
-  value = aws_dynamodb_table.hosts.name
-}
-
-output "queue_url" {
-  value = aws_sqs_queue.pool_events.url
+output "stack" {
+  value = {
+    bucket    = aws_s3_bucket.snapshots.bucket
+    table     = aws_dynamodb_table.hosts.name
+    queue_url = aws_sqs_queue.pool_events.url
+  }
 }

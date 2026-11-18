@@ -2,76 +2,60 @@
 set -euo pipefail
 
 FC_VERSION="${FC_VERSION:-v1.18.0}"
+FC_CI="${FC_CI:-https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261111-778a26c0594c-0}"
+FC_KERNEL="${FC_KERNEL:-vmlinux-6.18.62}"
 FC_ROOT="${FC_ROOT:-/srv/fc}"
-FC_DEVICE="${FC_DEVICE:-}"
-FC_LOOP_SIZE="${FC_LOOP_SIZE:-40G}"
 BLOCKDIFF_REV="${BLOCKDIFF_REV:-8d10a60bfb31a9dd773843395e9ab3d7bb6dff9c}"
-HOST_USER="${SUDO_USER:-${HOST_USER:-root}}"
+HOST_USER="${SUDO_USER:-root}"
 ARCH="$(uname -m)"
 
 export DEBIAN_FRONTEND=noninteractive
+systemctl stop apt-daily.timer apt-daily-upgrade.timer
+systemd-run --quiet --wait --property=After=apt-daily.service --property=After=apt-daily-upgrade.service /bin/true
 apt-get update -qq
-apt-get install -y -qq xfsprogs squashfs-tools e2fsprogs jq curl acl python3 cargo >/dev/null
+apt-get -o DPkg::Lock::Timeout=300 install -y -qq xfsprogs squashfs-tools e2fsprogs curl acl python3 cargo >/dev/null
 
 usermod -aG kvm "$HOST_USER"
 setfacl -m "u:${HOST_USER}:rw" /dev/kvm
 
+cache=/var/lib/fc-cache.xfs
 if ! mountpoint -q "$FC_ROOT"; then
-  mkdir -p "$FC_ROOT"
-  if [ -z "$FC_DEVICE" ]; then
-    FC_DEVICE=/var/lib/fc-cache.xfs
-    [ -f "$FC_DEVICE" ] || { truncate -s "$FC_LOOP_SIZE" "$FC_DEVICE"; mkfs.xfs -q -m reflink=1 "$FC_DEVICE"; }
-    grep -q "$FC_DEVICE" /etc/fstab || echo "$FC_DEVICE $FC_ROOT xfs loop,noatime 0 0" >> /etc/fstab
-  else
-    blkid "$FC_DEVICE" >/dev/null 2>&1 || mkfs.xfs -q -m reflink=1 "$FC_DEVICE"
-    grep -q "$FC_DEVICE" /etc/fstab || echo "$FC_DEVICE $FC_ROOT xfs noatime 0 0" >> /etc/fstab
-  fi
-  mount "$FC_ROOT"
+  [ -f "$cache" ] || { truncate -s 40G "$cache"; mkfs.xfs -q -m reflink=1 "$cache"; }
+  grep -q "$cache" /etc/fstab || echo "$cache $FC_ROOT xfs loop,noatime 0 0" >> /etc/fstab
+  mkdir -p "$FC_ROOT" && mount "$FC_ROOT"
 fi
-xfs_info "$FC_ROOT" | grep -q "reflink=1" || { echo "reflink is off on $FC_ROOT"; exit 1; }
 mkdir -p "$FC_ROOT"/{base,snapshots,vms}
-chown -R "$HOST_USER" "$FC_ROOT"
 
-if ! command -v firecracker >/dev/null || ! firecracker --version | grep -q "${FC_VERSION#v}" || ! command -v snapshot-editor >/dev/null; then
+if ! firecracker --version 2>/dev/null | grep -q "${FC_VERSION#v}" || ! command -v snapshot-editor >/dev/null; then
   tmp="$(mktemp -d)"
-  url="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-${ARCH}.tgz"
-  curl -fsSL -o "$tmp/fc.tgz" "$url"
-  curl -fsSL -o "$tmp/fc.tgz.sha256.txt" "$url.sha256.txt"
-  (cd "$tmp" && sed "s|firecracker-${FC_VERSION}-${ARCH}.tgz|fc.tgz|" fc.tgz.sha256.txt | sha256sum -c -)
-  tar -xzf "$tmp/fc.tgz" -C "$tmp"
-  install -m 0755 "$tmp/release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH}" /usr/local/bin/firecracker
-  install -m 0755 "$tmp/release-${FC_VERSION}-${ARCH}/jailer-${FC_VERSION}-${ARCH}" /usr/local/bin/jailer
-  install -m 0755 "$tmp/release-${FC_VERSION}-${ARCH}/snapshot-editor-${FC_VERSION}-${ARCH}" /usr/local/bin/snapshot-editor
+  release="firecracker-${FC_VERSION}-${ARCH}"
+  url="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/${release}.tgz"
+  curl -fsSL --output-dir "$tmp" -O "$url" -O "$url.sha256.txt"
+  (cd "$tmp" && sha256sum -c "${release}.tgz.sha256.txt")
+  tar -xzf "$tmp/${release}.tgz" -C "$tmp"
+  for bin in firecracker snapshot-editor; do
+    install -m 0755 "$tmp/release-${FC_VERSION}-${ARCH}/${bin}-${FC_VERSION}-${ARCH}" "/usr/local/bin/$bin"
+  done
   rm -rf "$tmp"
 fi
 
-if [ "$(cat /usr/local/share/blockdiff.rev 2>/dev/null)" != "$BLOCKDIFF_REV" ]; then
-  cargo install --quiet --locked --root /usr/local --git https://github.com/CognitionAI/blockdiff --rev "$BLOCKDIFF_REV"
-  mkdir -p /usr/local/share && echo "$BLOCKDIFF_REV" > /usr/local/share/blockdiff.rev
-fi
+cargo install --quiet --locked --root /usr/local --git https://github.com/CognitionAI/blockdiff --rev "$BLOCKDIFF_REV"
 
 base="$FC_ROOT/base"
 if [ ! -f "$base/rootfs.ext4" ]; then
-  S3="https://s3.amazonaws.com/spec.ccfc.min"
-  prefix=$(curl -fsSL "$S3?list-type=2&prefix=firecracker-ci/&delimiter=/" \
-    | grep -oP "(?<=<Prefix>)firecracker-ci/[0-9]{8}-[^/]+/(?=</Prefix>)" | sort | tail -1)
-  kernel_key=$(curl -fsSL "$S3?list-type=2&prefix=${prefix}${ARCH}/vmlinux-" \
-    | grep -oP "(?<=<Key>)(${prefix}${ARCH}/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3})(?=</Key>)" | sort -V | tail -1)
-  ubuntu_key=$(curl -fsSL "$S3?list-type=2&prefix=${prefix}${ARCH}/ubuntu-" \
-    | grep -oP "(?<=<Key>)(${prefix}${ARCH}/ubuntu-[0-9]+\.[0-9]+\.squashfs)(?=</Key>)" | sort -V | tail -1)
-  curl -fsSL -o "$base/vmlinux" "$S3/$kernel_key"
   work="$(mktemp -d)"
-  curl -fsSL -o "$work/rootfs.squashfs" "$S3/$ubuntu_key"
+  curl -fsSL -o "$base/vmlinux" "$FC_CI/$ARCH/$FC_KERNEL"
+  curl -fsSL -o "$work/rootfs.squashfs" "$FC_CI/$ARCH/ubuntu-24.04.squashfs"
   unsquashfs -q -d "$work/root" "$work/rootfs.squashfs"
   chown -R root:root "$work/root"
   truncate -s 1G "$base/rootfs.ext4"
   mkfs.ext4 -q -d "$work/root" -F "$base/rootfs.ext4"
   rm -rf "$work"
-  printf '%s\n%s\n' "$kernel_key" "$ubuntu_key" > "$base/SOURCES"
-  chown -R "$HOST_USER" "$base"
+  echo "$FC_CI/$ARCH/$FC_KERNEL + ubuntu-24.04.squashfs" > "$base/SOURCES"
 fi
+chown -R "$HOST_USER" "$FC_ROOT"
 
 echo "firecracker: $(firecracker --version | head -1)"
 echo "blockdiff: CognitionAI/blockdiff@${BLOCKDIFF_REV:0:7}"
 echo "cache: $FC_ROOT on $(findmnt -no SOURCE "$FC_ROOT") (reflink on)"
-echo "base: $(cat "$base/SOURCES" | tr '\n' ' ')"
+echo "base: $(cat "$base/SOURCES")"
