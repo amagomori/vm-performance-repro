@@ -13,7 +13,7 @@ export DEBIAN_FRONTEND=noninteractive
 systemctl stop apt-daily.timer apt-daily-upgrade.timer
 systemd-run --quiet --wait --property=After=apt-daily.service --property=After=apt-daily-upgrade.service /bin/true
 apt-get update -qq
-apt-get -o DPkg::Lock::Timeout=300 install -y -qq xfsprogs squashfs-tools e2fsprogs curl acl python3 cargo >/dev/null
+apt-get -o DPkg::Lock::Timeout=300 install -y -qq xfsprogs squashfs-tools e2fsprogs curl acl python3 cargo docker.io git rsync >/dev/null
 
 usermod -aG kvm "$HOST_USER"
 setfacl -m "u:${HOST_USER}:rw" /dev/kvm

@@ -1,7 +1,8 @@
-import argparse
+import io
 import shlex
 import signal
 import sys
+import tarfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from pathlib import Path
 import boto3
 from botocore.config import Config
 
-HERE = Path(__file__).resolve().parent
+REPO = Path(__file__).resolve().parent.parent
 AWS = Config(signature_version="s3v4", ignore_configured_endpoint_urls=True)
 DEFAULT_TYPES = {"arm64": "c8g.metal-24xl", "x86_64": "c8i.xlarge"}
 AMI_PARAM = "/aws/service/canonical/ubuntu/server/24.04/stable/current/{}/hvm/ebs-gp3/ami-id"
@@ -79,9 +80,9 @@ class ScratchBucket:
         return self.bucket.meta.client.generate_presigned_url(
             method, Params={"Bucket": self.bucket.name, "Key": key}, ExpiresIn=self.expires - int(time.time()))
 
-    def upload(self, path):
-        self.bucket.upload_file(str(path), path.name)
-        return self.url("get_object", path.name)
+    def put(self, key, body):
+        self.bucket.put_object(Key=key, Body=body)
+        return self.url("get_object", key)
 
     def has(self, key):
         return any(self.bucket.objects.filter(Prefix=key))
@@ -111,15 +112,22 @@ def stop(signum, frame):
     sys.exit(f"Stopped by signal {signum}")
 
 
+def bundle():
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for path in [REPO / "host-setup.sh", REPO / "bench.py", *sorted((REPO / "benchmarks").glob("*.py"))]:
+            tar.add(path, arcname=path.relative_to(REPO))
+    return buffer.getvalue()
+
+
 def user_data(files, timeout, bench_args):
     env = {
-        "HOST_SETUP_URL": files.upload(HERE.parent / "host-setup.sh"),
-        "BENCH_URL": files.upload(HERE.parent / "bench.py"),
+        "BUNDLE_URL": files.put("bundle.tgz", bundle()),
         "LOG_URL": files.url("put_object", "log.txt"),
         "RESULTS_URL": files.url("put_object", "results.md"),
         "TIMEOUT": str(timeout),
     }
-    shebang, body = (HERE / "user-data.sh").read_text().split("\n", 1)
+    shebang, body = (REPO / "ec2" / "user-data.sh").read_text().split("\n", 1)
     return "\n".join([shebang, *(f"{key}={shlex.quote(value)}" for key, value in env.items()),
                       f"BENCH_ARGS=({shlex.join(bench_args)})", body])
 
@@ -136,37 +144,24 @@ def wait_for_log(ec2, instance, files, minutes):
         time.sleep(15)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Run bench.py on a fresh EC2 host and print its results. Other arguments go to bench.py.")
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--arch", choices=DEFAULT_TYPES,
-                        help="Use the default host for this arch: c8g.metal-24xl or c8i.xlarge.")
-    target.add_argument("--instance-type", help="Any .metal type, or any type with nested virtualization.")
-    parser.add_argument("--timeout", type=int, default=30, help="Minutes before the host shuts down and terminates.")
-    args, bench_args = parser.parse_known_args()
-
+def run(target, timeout, bench_args):
     for signum in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, stop)
     ec2 = boto3.client("ec2", config=AWS)
     sweep(ec2)
-    host = Host.lookup(ec2, args.instance_type or DEFAULT_TYPES[args.arch])
-    expires = int(time.time()) + (args.timeout + 30) * 60
+    host = Host.lookup(ec2, DEFAULT_TYPES.get(target, target))
+    expires = int(time.time()) + (timeout + 30) * 60
     with ScratchBucket(expires) as files:
-        instance = host.launch(ec2, user_data(files, args.timeout, bench_args), expires)
+        instance = host.launch(ec2, user_data(files, timeout, bench_args), expires)
         print(f"{instance}: {host.instance_type} ({host.arch}) in {host.zone}", flush=True)
         try:
-            wait_for_log(ec2, instance, files, args.timeout + 15)
+            wait_for_log(ec2, instance, files, timeout + 15)
         finally:
             ec2.terminate_instances(InstanceIds=[instance])
         if files.has("results.md"):
             print(files.read("results.md"))
         elif files.has("log.txt"):
             print("\n".join(files.read("log.txt").splitlines()[-40:]))
-            sys.exit("bench.py failed. The last 40 log lines are above.")
+            sys.exit("The benchmark failed. The last 40 log lines are above.")
         else:
             sys.exit("The host stopped without uploading its log.")
-
-
-if __name__ == "__main__":
-    main()

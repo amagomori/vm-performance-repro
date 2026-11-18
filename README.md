@@ -4,7 +4,11 @@ Measures how much faster a Firecracker microVM starts from a memory snapshot tha
 
 ![Architecture: bench.py drives Firecracker VMs inside a Lima VM on the Mac, using an XFS reflink cache for disks and snapshots, while Terraform and boto3 checks run against Floci in Docker](docs/architecture.png)
 
-## What the benchmark does
+## What the benchmarks do
+
+`bench.py` runs one benchmark per call: `python3 bench.py snapshots` or `python3 bench.py task-forks`. Add `--help` after either name for its options.
+
+### `snapshots`
 
 1. **Cold path:** boots a VM from a reflink copy of a base disk, with dirty page tracking on, then runs a task setup that writes 50 MB to disk, fills 200 MB of guest RAM and waits 5 s.
 2. **Boot snapshot:** right after boot, a diff snapshot saves only the memory pages touched so far. It's the shared base for every task.
@@ -13,7 +17,15 @@ Measures how much faster a Firecracker microVM starts from a memory snapshot tha
 5. **Stage:** as a host would once per task, the memory layer is unpacked and merged onto the boot snapshot with `snapshot-editor`, and `blockdiff apply` rebuilds the disk. SHA-256 checks confirm the memory matches the full snapshot and the disk matches the source disk, byte for byte.
 6. **Forks:** resumes several VMs from the rebuilt snapshot, each on its own reflink copy of the staged disk with memory mapped copy-on-write. Each fork must answer a command and find the setup's marker file.
 
-`bench.py` repeats this and reports the median and range across runs.
+It repeats these steps and reports the median and range across runs.
+
+### `task-forks`
+
+1. **Real task:** fetches the [Terminal-Bench 2.0](https://github.com/harbor-framework/terminal-bench-2) task `modernize-scientific-stack` at a pinned commit and builds its image from its Dockerfile. The image has Python 3.13, gcc, gfortran, numpy, pandas, scipy and matplotlib. The guest gets the task's own 1 vCPU and 2 GiB.
+2. **Layered disk:** turns the image's base, `python:3.13-slim-bookworm`, into a shared base disk. The task image is copied onto a reflink copy of it, and `blockdiff` measures the task's own layer.
+3. **Cold path:** boots the task disk and runs a typical first command: import numpy, pandas, scipy and matplotlib, then read the task's CSV. It runs the command twice to show the warm-cache time too.
+4. **Snapshot:** pauses the warm VM and saves every memory page touched since boot.
+5. **Concurrent forks:** starts 1, 8 and 16 forks at once by default, each on its own reflink disk, and runs the same command in each. It reports wall time, the median and slowest restore and command, and host memory per fork.
 
 ## Requirements
 
@@ -38,10 +50,14 @@ Run every command from the repo root.
    limactl shell fc-host -- sudo ./host-setup.sh
    ```
 
-3. Run the benchmark:
+3. Run a benchmark. `task-forks` needs root, to run Docker and mount the task disk, and runs one fork here because forks are slow under the Mac's nested virtualization:
 
    ```bash
-   limactl shell fc-host -- python3 bench.py --forks 5 --runs 3
+   limactl shell fc-host -- python3 bench.py snapshots --forks 5 --runs 3
+   ```
+
+   ```bash
+   limactl shell fc-host -- sudo python3 bench.py task-forks --forks 1
    ```
 
 4. Stop the VM when you're done:
@@ -52,9 +68,9 @@ Run every command from the repo root.
 
 ## Run it on EC2
 
-`ec2/run.py` runs the same benchmark on a fresh EC2 host, so you can measure the architecture your machine doesn't have. It prints the results table and terminates the host.
+`--ec2` runs either benchmark on a fresh EC2 host, so you can measure the architecture your machine doesn't have. It prints the results table and terminates the host.
 
-| `--arch` | Default host | Why |
+| `--ec2` | Host | Why |
 |---|---|---|
 | `x86_64` | `c8i.xlarge` | Intel with nested virtualization, and 4 vCPUs and 8 GiB like the Lima VM |
 | `arm64` | `c8g.metal-24xl` | Graviton has no nested virtualization, so Firecracker needs bare metal |
@@ -62,17 +78,17 @@ Run every command from the repo root.
 Run it from a shell without `.env` loaded, signed in to the AWS account you want to use:
 
 ```bash
-AWS_PROFILE=your-profile uv run python ec2/run.py --arch x86_64
+AWS_PROFILE=your-profile uv run python bench.py --ec2 x86_64 snapshots
 ```
 
 - **What it needs:** a default VPC with internet access, and permission to use EC2, S3 and SSM parameters.
-- **Other hosts:** pass `--instance-type` instead of `--arch` with any `.metal` type, or any type with nested virtualization.
-- **Benchmark options:** other arguments, such as `--forks 10`, go to `bench.py`.
+- **Other hosts:** `--ec2` also takes an instance type: any `.metal` type, or any type with nested virtualization.
+- **Benchmark options:** options after the benchmark name, such as `task-forks --forks 1,16,64`, run on the host as given.
 - **Temporary resources only:** each run makes one host, its disk and one S3 bucket, and nothing else. Files move through the bucket with presigned URLs, so the host needs no IAM role or open port.
 - **Normal cleanup:** when the script ends, including on Ctrl-C or `kill`, it terminates the host and deletes the bucket. The disk is deleted with the host.
 - **If the script dies:** the host shuts itself down and terminates after `--timeout` minutes (30 by default). The host and bucket also carry an expiry, and every run first removes any expired ones an earlier run left behind.
 
-## Results
+## Results: `snapshots`
 
 Firecracker v1.18.0, `blockdiff` at commit `8d10a60`, and the pinned guest kernel 6.18.62 with an Ubuntu 24.04 disk. Guests have 1 vCPU and 512 MiB, and each number is the median of 3 runs of 5 forks.
 
@@ -119,6 +135,40 @@ On every host, the rebased memory matched a full snapshot and the staged disk ma
 - **Cost:** dirty page tracking slowed the Mac's setup to 10.2 s, from 8.2 s in earlier runs without it, because KVM logs every guest memory write.
 - **Disk speed:** `blockdiff create` and `apply` take milliseconds because, on the same XFS filesystem, they clone blocks instead of copying them. On a real host, the cost of staging is downloading the diffs.
 
+## Results: `task-forks`
+
+Task `modernize-scientific-stack` at commit `2fd12b8`, in guests with the task's own 1 vCPU and 2 GiB. One run per host, with the same Firecracker, kernel and `blockdiff` as above.
+
+| Step | `c8i.4xlarge`: x86_64, nested, 16 vCPUs | `c8g.metal-24xl`: arm64, bare metal, 96 vCPUs |
+|---|---|---|
+| Build the task image from its Dockerfile | 70.6 s | 65.9 s |
+| Shared base disk from `python:3.13-slim-bookworm` | 197 MiB | 193 MiB |
+| Task layer over the shared base | 904 MiB | 858 MiB |
+| Cold boot to a shell | 1.3 s | 171 ms |
+| First command in the cold VM: imports + read the CSV | 1.8 s | 865 ms |
+| Same command again in the cold VM, cache warm | 659 ms | 573 ms |
+| Snapshot of the warm VM | 1.3 s | 1.3 s |
+| Memory file (sparse, of 2048 MiB) | 277 MiB | 277 MiB |
+
+| Forks started at once | 1 | 16 | 64 |
+|---|---|---|---|
+| **`c8i.4xlarge`: all forks answered** | **1.7 s** | **3.2 s** | **15.6 s** |
+| Restore, median / slowest | 6 ms / 6 ms | 6 ms / 14 ms | 27 ms / 65 ms |
+| First command, median / slowest | 1.7 s / 1.7 s | 3.1 s / 3.1 s | 14.0 s / 15.1 s |
+| Host memory per fork | 98 MiB | 94 MiB | 83 MiB |
+| **`c8g.metal-24xl`: all forks answered** | **729 ms** | **921 ms** | **2.0 s** |
+| Restore, median / slowest | 4 ms / 4 ms | 3 ms / 4 ms | 4 ms / 6 ms |
+| First command, median / slowest | 714 ms / 714 ms | 845 ms / 856 ms | 1.6 s / 1.6 s |
+| Host memory per fork | 83 MiB | 90 MiB | 80 MiB |
+
+- **Snapshot size:** a warm snapshot of a real task is 277 MiB of its 2 GiB guest. Pages the guest never touched stay holes, as in `snapshots`.
+- **Concurrency on bare metal:** 64 forks restore in 4 to 6 ms each and all answer within 2.0 s. One fork alone answers in 714 ms.
+- **Nesting costs on first touch:** each memory page a fork reads for the first time is a page fault. Under nesting, the outer hypervisor handles that fault too, so a single nested fork takes 1.7 s against 659 ms warm in the cold VM. 64 nested forks on 16 vCPUs take 15.6 s.
+- **Memory per fork:** each fork adds 80 to 98 MiB of host memory, measured as the drop in `MemAvailable`. That is mostly the new Python process's own memory. The snapshot itself is shared, so CPU runs out before memory does.
+- **Disk:** the task's own layer is about 880 MiB on a shared base of about 195 MiB, and forks add almost no disk.
+- **What the snapshot saves:** each command here starts a new Python process, so a fork skips the boot and gets a warm page cache, but repeats the imports. Snapshots save more when the setup leaves something running, like a service or a warm interpreter.
+- **On the Mac:** use EC2 for `task-forks`. Under Lima, one fork's first command took 14.8 s against 2.2 s warm, and 8 forks at once didn't finish within 10 minutes.
+
 ## Local AWS with Floci
 
 The control-plane pieces (S3, DynamoDB, SQS, EventBridge) are a Terraform stack in `aws/`, applied to Floci, a free AWS emulator. The stack has nothing Floci-specific: `.env` points the AWS SDKs and Terraform at Floci and explains each macOS workaround. Without `.env`, the same stack applies to real AWS.
@@ -157,12 +207,15 @@ The control-plane pieces (S3, DynamoDB, SQS, EventBridge) are a Terraform stack 
 
 | Path | Purpose |
 |---|---|
-| `bench.py` | Runs the cold path, memory and disk checkpoints, stage and forks, then prints the results table |
+| `bench.py` | Runs a benchmark here, or on EC2 with `--ec2` |
+| `benchmarks/firecracker.py` | Firecracker VM control and the shared guest and cache settings |
+| `benchmarks/snapshots.py` | The `snapshots` benchmark: cold path, memory and disk checkpoints, stage and forks |
+| `benchmarks/task_forks.py` | The `task-forks` benchmark: a real task image, a warm snapshot and concurrent forks |
 | `host-setup.sh` | Prepares a Firecracker host: an XFS reflink cache, Firecracker and `snapshot-editor`, `blockdiff`, and a pinned guest kernel and disk |
 | `lima/fc-host.yaml` | Ubuntu 24.04 VM with nested virtualization |
 | `aws/main.tf` | Terraform stack: S3 bucket, DynamoDB table, SQS queue and an EventBridge rule into the queue |
 | `aws/check.py` | boto3 checks against the stack's Terraform outputs |
-| `ec2/run.py` | Launches a fresh arm64 or x86_64 EC2 host, prints its results, then cleans up |
+| `ec2/runner.py` | Launches a fresh arm64 or x86_64 EC2 host for `--ec2`, prints its results, then cleans up |
 | `ec2/user-data.sh` | Runs `host-setup.sh` and `bench.py` on that host and uploads the results |
 | `.env` | Floci settings and workarounds |
 | `docs/architecture.png` | The diagram above, drawn in Paper |
@@ -173,3 +226,4 @@ The control-plane pieces (S3, DynamoDB, SQS, EventBridge) are a Terraform stack 
 - [`CognitionAI/blockdiff`](https://github.com/CognitionAI/blockdiff) has no license file, so this repo doesn't include its code. `host-setup.sh` builds it from GitHub at a pinned commit. Using it beyond this experiment needs Cognition's permission or a rewrite.
 - Diff memory snapshots are in Firecracker's developer preview, so their behavior may change between releases. Dirty page tracking also slows guest memory writes and cancels most of the benefit of huge pages.
 - A snapshot resumes only on the CPU model that made it, so a fleet needs one set of snapshots per host type.
+- Forks have no network, and they start with the same hostname and process state. Per-fork networking and identity aren't tested yet.
