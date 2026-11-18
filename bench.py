@@ -113,18 +113,38 @@ def disk_used_mib():
     return int(out.split()[-1]) / 2**20
 
 
+def allocated_mib(path):
+    return path.stat().st_blocks * 512 / 2**20
+
+
+def snapshot(vm, kind, vmstate, mem):
+    t = time.perf_counter()
+    vm.api("PUT", "/snapshot/create", {"snapshot_type": kind, "snapshot_path": str(vmstate), "mem_file_path": str(mem)})
+    return time.perf_counter() - t
+
+
 def run_once(forks):
     m = {}
+    snap = SNAPS / "task"
+    shutil.rmtree(snap, ignore_errors=True)
+    snap.mkdir(parents=True)
     src = VM("source")
     m["Reflink copy of the 1 GiB base disk"] = ("s", reflink(BASE / "rootfs.ext4", src.dir / "rootfs.ext4"))
     src.api("PUT", "/boot-source", {"kernel_image_path": str(BASE / "vmlinux"), "boot_args": BOOT_ARGS})
     src.api("PUT", "/drives/rootfs", {"drive_id": "rootfs", "path_on_host": str(src.dir / "rootfs.ext4"),
                                        "is_root_device": True, "is_read_only": False})
-    src.api("PUT", "/machine-config", {"vcpu_count": 1, "mem_size_mib": MEM_MIB})
+    src.api("PUT", "/machine-config", {"vcpu_count": 1, "mem_size_mib": MEM_MIB, "track_dirty_pages": True})
     t = time.perf_counter()
     src.api("PUT", "/actions", {"action_type": "InstanceStart"})
     src.wait_for(r"root@[\w-]+:~# ")
     boot = time.perf_counter() - t
+
+    t = time.perf_counter()
+    src.api("PATCH", "/vm", {"state": "Paused"})
+    snapshot(src, "Diff", snap / "boot.vmstate", snap / "boot.mem")
+    src.api("PATCH", "/vm", {"state": "Resumed"})
+    boot_snap = time.perf_counter() - t
+
     t = time.perf_counter()
     src.send(SETUP + "\n")
     src.wait_for(r"\nSETUP-DONE", timeout=120)
@@ -135,21 +155,38 @@ def run_once(forks):
     m["Cold path total (boot + setup)"] = ("s", boot + setup)
     m["Memory of the set-up VM (RSS)"] = ("MiB", src.mem_mib()["Rss"])
 
-    snap = SNAPS / "task"
-    shutil.rmtree(snap, ignore_errors=True)
-    snap.mkdir(parents=True)
     t = time.perf_counter()
     src.api("PATCH", "/vm", {"state": "Paused"})
-    src.api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": str(snap / "vmstate"),
-                                         "mem_file_path": str(snap / "mem")})
-    m[f"Pause + full snapshot ({MEM_MIB} MiB guest)"] = ("s", time.perf_counter() - t)
+    snapshot(src, "Diff", snap / "vmstate", snap / "layer.mem")
+    layer_snap = time.perf_counter() - t
+    full_snap = snapshot(src, "Full", snap / "full.vmstate", snap / "full.mem")
     src.kill()
+    m["Boot snapshot: pause + diff since boot + resume"] = ("s", boot_snap)
+    m["Setup snapshot: pause + diff since the boot snapshot"] = ("s", layer_snap)
+    m["For comparison: full snapshot of the same state"] = ("s", full_snap)
+
+    m["Memory file: full snapshot"] = ("MiB", allocated_mib(snap / "full.mem"))
+    m["Memory file: boot snapshot (sparse)"] = ("MiB", allocated_mib(snap / "boot.mem"))
+    m["Memory file: setup layer (sparse)"] = ("MiB", allocated_mib(snap / "layer.mem"))
+    blockdiff("create", snap / "layer.bdiff", snap / "layer.mem")
+    m["Memory layer packed with blockdiff"] = ("MiB", (snap / "layer.bdiff").stat().st_size / 2**20)
+
+    t = time.perf_counter()
+    blockdiff("apply", snap / "layer.bdiff", snap / "layer.unpacked.mem")
+    reflink(snap / "boot.mem", snap / "mem")
+    subprocess.run(["snapshot-editor", "edit-memory", "rebase", "--memory-path", str(snap / "mem"),
+                    "--diff-path", str(snap / "layer.unpacked.mem")], check=True, capture_output=True)
+    m["Stage memory: unpack + rebase onto the boot snapshot"] = ("s", time.perf_counter() - t)
+    mem_ok = sha256(snap / "mem") == sha256(snap / "full.mem")
+
     m["Disk checkpoint: blockdiff create"] = ("s", blockdiff("create", snap / "disk.bdiff", src.dir / "rootfs.ext4",
                                                              "--base", BASE / "rootfs.ext4"))
     m["Disk checkpoint size (the full disk is 1024 MiB)"] = ("MiB", (snap / "disk.bdiff").stat().st_size / 2**20)
-    m["Stage on a host: blockdiff apply onto the base"] = ("s", blockdiff("apply", snap / "disk.bdiff", snap / "disk.ext4",
-                                                                          "--base", BASE / "rootfs.ext4"))
-    verified = sha256(snap / "disk.ext4") == sha256(src.dir / "rootfs.ext4")
+    m["Stage disk: blockdiff apply onto the base"] = ("s", blockdiff("apply", snap / "disk.bdiff", snap / "disk.ext4",
+                                                                     "--base", BASE / "rootfs.ext4"))
+    disk_ok = sha256(snap / "disk.ext4") == sha256(src.dir / "rootfs.ext4")
+    upload = ((snap / "layer.bdiff").stat().st_size + (snap / "disk.bdiff").stat().st_size) / 2**20
+    m[f"Upload per task: memory layer + disk diff (full: {MEM_MIB + 1024} MiB)"] = ("MiB", upload)
 
     for old in VMS.glob("fork-*"):
         shutil.rmtree(old)
@@ -180,7 +217,7 @@ def run_once(forks):
     m[f"Extra cache disk used by {forks} forks"] = ("MiB", disk_used_mib() - used_before)
     for vm, *_ in resumed:
         vm.kill()
-    return m, verified
+    return m, disk_ok, mem_ok
 
 
 def fmt(unit, value):
@@ -204,14 +241,16 @@ def main():
     parser.add_argument("--runs", type=int, default=3, help="Full runs to take the median over.")
     args = parser.parse_args()
     runs = []
-    matches = 0
+    disk_matches = mem_matches = 0
     for i in range(args.runs):
-        metrics, verified = run_once(args.forks)
+        metrics, disk_ok, mem_ok = run_once(args.forks)
         runs.append(metrics)
-        matches += verified
+        disk_matches += disk_ok
+        mem_matches += mem_ok
         print(f"run {i + 1}/{args.runs} done", flush=True)
     print(f"\n{environment()} · {args.runs} runs · median and range across runs")
-    print(f"Staged disk matches the source disk byte for byte (SHA-256) in {matches}/{args.runs} runs\n")
+    print(f"Staged disk matches the source disk byte for byte (SHA-256) in {disk_matches}/{args.runs} runs")
+    print(f"Rebased memory matches a full snapshot byte for byte (SHA-256) in {mem_matches}/{args.runs} runs\n")
     print("| Step | Median | Range |\n|---|---|---|")
     for name, (unit, _) in runs[0].items():
         values = [r[name][1] for r in runs]

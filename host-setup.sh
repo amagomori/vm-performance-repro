@@ -32,7 +32,7 @@ xfs_info "$FC_ROOT" | grep -q "reflink=1" || { echo "reflink is off on $FC_ROOT"
 mkdir -p "$FC_ROOT"/{base,snapshots,vms}
 chown -R "$HOST_USER" "$FC_ROOT"
 
-if ! command -v firecracker >/dev/null || ! firecracker --version | grep -q "${FC_VERSION#v}"; then
+if ! command -v firecracker >/dev/null || ! firecracker --version | grep -q "${FC_VERSION#v}" || ! command -v snapshot-editor >/dev/null; then
   tmp="$(mktemp -d)"
   url="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-${ARCH}.tgz"
   curl -fsSL -o "$tmp/fc.tgz" "$url"
@@ -41,6 +41,7 @@ if ! command -v firecracker >/dev/null || ! firecracker --version | grep -q "${F
   tar -xzf "$tmp/fc.tgz" -C "$tmp"
   install -m 0755 "$tmp/release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH}" /usr/local/bin/firecracker
   install -m 0755 "$tmp/release-${FC_VERSION}-${ARCH}/jailer-${FC_VERSION}-${ARCH}" /usr/local/bin/jailer
+  install -m 0755 "$tmp/release-${FC_VERSION}-${ARCH}/snapshot-editor-${FC_VERSION}-${ARCH}" /usr/local/bin/snapshot-editor
   rm -rf "$tmp"
 fi
 
