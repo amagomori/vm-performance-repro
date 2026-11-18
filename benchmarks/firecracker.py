@@ -89,11 +89,23 @@ class VM:
         self.api("PUT", "/snapshot/create", {"snapshot_type": kind, "snapshot_path": str(vmstate),
                                               "mem_file_path": str(mem)})
 
-    def restore(self, vmstate, mem):
-        self.api("PUT", "/snapshot/load", {"snapshot_path": str(vmstate), "resume_vm": False,
-                                            "mem_backend": {"backend_type": "File", "backend_path": str(mem)}})
+    def load(self, vmstate, backend, path, huge_pages=None):
+        body = {"snapshot_path": str(vmstate), "resume_vm": False,
+                "mem_backend": {"backend_type": backend, "backend_path": str(path)}}
+        self.api("PUT", "/snapshot/load", body | ({"huge_pages": huge_pages} if huge_pages else {}))
         self.api("PATCH", "/drives/rootfs", {"drive_id": "rootfs", "path_on_host": str(self.disk)})
+
+    def restore(self, vmstate, mem):
+        self.load(vmstate, "File", mem)
         self.resume()
+
+    def faults(self):
+        fields = Path(f"/proc/{self.proc.pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(fields[7]) + int(fields[9])
+
+    def kvm_exits(self):
+        stats = list(Path("/sys/kernel/debug/kvm").glob(f"{self.proc.pid}-*/exits"))
+        return sum(int(p.read_text()) for p in stats) if stats else None
 
     def send(self, text):
         os.write(self.stdin, text.encode())
@@ -102,6 +114,8 @@ class VM:
         deadline = time.time() + timeout
         rx = re.compile(pattern.encode())
         while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"{self.dir.name}: firecracker exited with {self.proc.returncode}")
             if m := rx.search(self.log.read_bytes(), self.offset):
                 self.offset = m.end()
                 return
@@ -115,7 +129,9 @@ class VM:
     def kill(self):
         self.proc.kill()
         self.proc.wait()
-        os.close(self.stdin)
+        if self.stdin is not None:
+            os.close(self.stdin)
+            self.stdin = None
 
 
 def run(*argv):
@@ -137,6 +153,10 @@ def allocated_mib(path):
 
 
 def fmt(unit, value):
+    if value is None:
+        return "n/a"
+    if unit == "count":
+        return f"{value:,.0f}"
     if unit == "MiB":
         if value < 0:
             return "≈ 0 MiB"

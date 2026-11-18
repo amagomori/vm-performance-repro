@@ -33,6 +33,17 @@ With `--service`, the snapshot holds a running app instead:
 - **Snapshot:** the cold VM starts the app and waits until `/health` answers, so the app is already listening in every fork.
 - **Forks:** each fork sends one `GET /stats` to that app from inside the guest, so no fork needs a network.
 
+With `--memory`, forks restore their memory in up to four ways, compared side by side:
+
+| Mode | How a fork gets its memory |
+|---|---|
+| `file` | Firecracker maps the snapshot file, shared by every fork. Each page loads the first time the guest touches it. This is the default. |
+| `file-thp` | The same, with transparent huge pages requested |
+| `uffd` | A page-fault handler in `benchmarks/uffd.py` copies every page the snapshot holds into the fork before it resumes, then hands the rest back to the kernel. Memory is private to each fork. |
+| `uffd-2m` | The same, into 2 MiB huge pages, so the VM's page tables need far fewer entries |
+
+Each mode also reports host page faults and KVM exits per fork, read from `/proc` and KVM's debugfs.
+
 ## Requirements
 
 - An Apple silicon Mac with an M3 or newer chip on macOS 15 or later, for nested virtualization. A Linux host with `/dev/kvm` also works.
@@ -203,6 +214,36 @@ Same task, hosts and settings. The snapshot is taken with the app already starte
 - **Memory per fork drops to about 12 MiB:** forks share the app's whole memory and only copy the pages they change. With a new Python process per command, each fork cost 80 to 98 MiB.
 - **What a real service would still need:** a fork keeps the app's open connections, secrets and random state from snapshot time. See the limitation on per-fork identity below.
 
+### With `--memory`: where a fork's time goes
+
+Same task and hosts, with `--service`. The median fork's restore plus first request:
+
+| Forks at once | Host | `file` | `file-thp` | `uffd` | `uffd-2m` |
+|---|---|---|---|---|---|
+| 1 | `c8i.4xlarge`, nested | 226 ms | 226 ms | 180 ms | **98 ms** |
+| 16 | `c8i.4xlarge`, nested | 742 ms | 737 ms | 254 ms | **99 ms** |
+| 64 | `c8i.4xlarge`, nested | 2.0 s | 2.0 s | **562 ms** | 1.6 s |
+| 1 | `c8g.metal-24xl` | **34 ms** | 34 ms | 81 ms | 38 ms |
+| 16 | `c8g.metal-24xl` | 39 ms | **34 ms** | 82 ms | 40 ms |
+| 64 | `c8g.metal-24xl` | **34 ms** | 34 ms | 135 ms | 41 ms |
+
+Per fork, with 16 forks at once, on the nested host and then on bare metal:
+
+| | `file` | `file-thp` | `uffd` | `uffd-2m` |
+|---|---|---|---|---|
+| Host page faults | 3,350 / 3,158 | 3,351 / 3,158 | 131 / 101 | 129 / 98 |
+| KVM exits | 12,828 / 11,504 | 12,800 / 11,504 | 8,242 / 7,872 | 505 / 408 |
+| Copied in before resume | 0 | 0 | 319 MiB | 328 MiB |
+| First request | 734 / 35 ms | 731 / 30 ms | 143 / 20 ms | 20 / 10 ms |
+| Host memory per fork | 13 / 11 MiB | 7 MiB / ≈ 0 | 310 / 316 MiB | 321 / 323 MiB |
+
+- **KVM exits, not page faults:** copying memory in early removes 96% of a fork's host page faults. The fork still needs about 8,000 KVM exits to build the VM's own page tables, one for each 4 KiB page it touches. 2 MiB pages cut that to about 500.
+- **Nested hosts:** each exit is expensive under nesting, so 2 MiB pages take a fork from 742 ms to 99 ms with 16 forks at once. The first request then takes 20 ms, the same as in a warm VM.
+- **Bare metal:** exits are cheap, so the shared `file` mode is already as fast, at 34 ms, while using about 25 times less memory. Prefetching only adds the time to copy.
+- **The trade-off:** prefetched memory is private, about 320 MiB per fork, against about 12 MiB when forks share the snapshot file.
+- **64 nested forks:** copying 21 GiB at once becomes the limit. With 2 MiB pages, the reserved pool left only a few GiB for the page cache on this 32 GiB host, which likely slowed the copy to 1.6 s.
+- **Transparent huge pages:** no effect. The shared file mapping still loads in 4 KiB pages.
+
 ## Local AWS with Floci
 
 The control-plane pieces (S3, DynamoDB, SQS, EventBridge) are a Terraform stack in `aws/`, applied to Floci, a free AWS emulator. The stack has nothing Floci-specific: `.env` points the AWS SDKs and Terraform at Floci and explains each macOS workaround. Without `.env`, the same stack applies to real AWS.
@@ -245,6 +286,7 @@ The control-plane pieces (S3, DynamoDB, SQS, EventBridge) are a Terraform stack 
 | `benchmarks/firecracker.py` | Firecracker VM control and the shared guest and cache settings |
 | `benchmarks/snapshots.py` | The `snapshots` benchmark: cold path, memory and disk checkpoints, stage and forks |
 | `benchmarks/task_forks.py` | The `task-forks` benchmark: a real task image, a warm snapshot and concurrent forks |
+| `benchmarks/uffd.py` | A userfaultfd handler that copies a fork's memory in before it resumes |
 | `host-setup.sh` | Prepares a Firecracker host: an XFS reflink cache, Firecracker and `snapshot-editor`, `blockdiff`, and a pinned guest kernel and disk |
 | `lima/fc-host.yaml` | Ubuntu 24.04 VM with nested virtualization |
 | `aws/main.tf` | Terraform stack: S3 bucket, DynamoDB table, SQS queue and an EventBridge rule into the queue |
@@ -261,3 +303,4 @@ The control-plane pieces (S3, DynamoDB, SQS, EventBridge) are a Terraform stack 
 - Diff memory snapshots are in Firecracker's developer preview, so their behavior may change between releases. Dirty page tracking also slows guest memory writes and cancels most of the benefit of huge pages.
 - A snapshot resumes only on the CPU model that made it, so a fleet needs one set of snapshots per host type.
 - Forks have no network, and they start with the same hostname, open connections, secrets and random state as the snapshot. Per-fork networking and identity aren't tested yet.
+- `task-forks` sends commands over the serial console. Kernel messages printed right after a resume could make the emulated UART miss the receive interrupt, which hung some forks, so the guest's init keeps kernel messages off the console. A real sandbox would use vsock.

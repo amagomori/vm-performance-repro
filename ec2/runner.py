@@ -10,6 +10,7 @@ from pathlib import Path
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 REPO = Path(__file__).resolve().parent.parent
 AWS = Config(signature_version="s3v4", ignore_configured_endpoint_urls=True)
@@ -132,10 +133,19 @@ def user_data(files, timeout, bench_args):
                       f"BENCH_ARGS=({shlex.join(bench_args)})", body])
 
 
+def state_of(ec2, instance):
+    try:
+        return ec2.describe_instances(InstanceIds=[instance])["Reservations"][0]["Instances"][0]["State"]["Name"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "InvalidInstanceID.NotFound":
+            return "pending"
+        raise
+
+
 def wait_for_log(ec2, instance, files, minutes):
     start, state = time.time(), None
     while not files.has("log.txt"):
-        current = ec2.describe_instances(InstanceIds=[instance])["Reservations"][0]["Instances"][0]["State"]["Name"]
+        current = state_of(ec2, instance)
         if current != state:
             state = current
             print(f"{(time.time() - start) / 60:4.1f} min: {state}", flush=True)

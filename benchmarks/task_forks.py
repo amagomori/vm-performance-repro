@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from benchmarks.firecracker import VM, Guest, Stopwatch, allocated_mib, environment, fmt, reflink, run, size_mib
+from benchmarks.uffd import Prefetcher, Source
 
 HELP = "Build a real task image into a VM disk, snapshot it warm, and start many forks at once."
 TASKS_REPO = "https://github.com/harbor-framework/terminal-bench-2"
@@ -24,6 +25,7 @@ mount -t devpts devpts /dev/pts
 mount -t tmpfs tmpfs /dev/shm
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
+echo 1 > /proc/sys/kernel/printk
 hostname task
 ip link set lo up 2>/dev/null
 export HOME=/root PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin PS1='root@task:~# '
@@ -149,10 +151,10 @@ def build_disks(task, work, workload):
     return m, task_disk
 
 
-def command(vm, text, i):
+def command(vm, text, i, timeout=600):
     with Stopwatch() as watch:
         vm.send(f"{text} && echo DONE-$((0+{i}))\n")
-        vm.wait_for(rf"\nDONE-{i}\r?\n", timeout=600)
+        vm.wait_for(rf"\nDONE-{i}\r?\n", timeout=timeout)
     vm.wait_for(r"# ")
     return watch.seconds
 
@@ -179,38 +181,125 @@ def cold_path(cache, task, disk, snap, workload):
     return m
 
 
-def fork(cache, snap, workload, i):
+@dataclass(frozen=True)
+class Memory:
+    backend: str
+    huge_pages: str | None
+
+
+MEMORY = {
+    "file": Memory("File", None),
+    "file-thp": Memory("File", "Transparent"),
+    "uffd": Memory("Uffd", None),
+    "uffd-2m": Memory("Uffd", "2M"),
+}
+HUGE_PAGE = 2 * 2**20
+
+
+def fork(cache, snap, workload, memory, source, vms, i):
     vm = VM(cache.vms / f"task-fork-{i}")
+    vms.append(vm)
     reflink(snap / "disk.ext4", vm.disk)
+    faults = vm.faults()
+    prefetcher = Prefetcher(vm.dir / "uffd.sock", source) if source else None
     with Stopwatch() as restore:
-        vm.restore(snap / "vmstate", snap / "mem")
-    return vm, restore.seconds, command(vm, workload.text, i)
+        if prefetcher:
+            prefetcher.start()
+        vm.load(snap / "vmstate", memory.backend, vm.dir / "uffd.sock" if prefetcher else snap / "mem",
+                memory.huge_pages)
+        if prefetcher:
+            prefetcher.join()
+            if prefetcher.error:
+                raise prefetcher.error
+        vm.resume()
+    answer = command(vm, workload.text, i, timeout=120)
+    return vm, restore.seconds, answer, vm.faults() - faults, vm.kvm_exits(), prefetcher.copied if prefetcher else 0
 
 
-def mem_available_mib():
-    return int(re.search(r"^MemAvailable:\s+(\d+) kB", Path("/proc/meminfo").read_text(), re.M).group(1)) / 1024
+def meminfo(key):
+    return int(re.search(rf"^{key}:\s+(\d+)", Path("/proc/meminfo").read_text(), re.M).group(1))
 
 
-def fork_level(cache, snap, workload, n):
+def set_huge_pages(count):
+    Path("/proc/sys/vm/compact_memory").write_text("1")
+    Path("/proc/sys/vm/nr_hugepages").write_text(str(count))
+    return meminfo("HugePages_Total")
+
+
+def memory_used_mib():
+    return (meminfo("MemTotal") - meminfo("MemAvailable")) / 1024 + (
+        meminfo("HugePages_Total") - meminfo("HugePages_Free")) * HUGE_PAGE / 2**20
+
+
+def fork_level(cache, snap, workload, mode, n):
+    memory = MEMORY[mode]
     for old in cache.vms.glob("task-fork-*"):
         shutil.rmtree(old)
-    before = mem_available_mib()
-    with Stopwatch() as wall:
-        with ThreadPoolExecutor(n) as pool:
-            vms, restores, commands = zip(*pool.map(functools.partial(fork, cache, snap, workload), range(1, n + 1)))
-    used = before - mem_available_mib()
-    pss = sum(vm.mem_mib()["Pss"] for vm in vms)
-    for vm in vms:
-        vm.kill()
+    source = Source(snap / "mem") if memory.backend == "Uffd" else None
+    if memory.huge_pages == "2M":
+        need = n * (sum(b - a for a, b in source.extents_for(HUGE_PAGE)) // HUGE_PAGE + 64)
+        if set_huge_pages(need) < need:
+            print(f"{mode}, {n} forks: skipped, the host can't reserve {need} huge pages", flush=True)
+            set_huge_pages(0)
+            source.close()
+            return None
+    vms = []
+    try:
+        before = memory_used_mib()
+        with Stopwatch() as wall:
+            with ThreadPoolExecutor(n) as pool:
+                results = list(pool.map(functools.partial(fork, cache, snap, workload, memory, source, vms),
+                                        range(1, n + 1)))
+        used = memory_used_mib() - before
+    except Exception as e:
+        report(mode, n, e, vms)
+        return {}
+    finally:
+        for vm in vms:
+            vm.kill()
+        if source:
+            source.close()
+        if memory.huge_pages == "2M":
+            set_huge_pages(0)
+    print(f"{mode}, {n} forks: done in {wall.seconds:.1f} s", flush=True)
+    _, restores, answers, faults, exits, copied = zip(*results)
     return {
-        f"Start all forks and answer one {workload.noun} each": ("s", wall.seconds),
+        f"All forks answered one {workload.noun}": ("s", wall.seconds),
         "Restore, median": ("s", statistics.median(restores)),
-        "Restore, slowest": ("s", max(restores)),
-        f"First {workload.noun}, median": ("s", statistics.median(commands)),
-        f"First {workload.noun}, slowest": ("s", max(commands)),
-        "Host memory per fork (PSS)": ("MiB", pss / n),
-        "Host memory per fork (drop in MemAvailable)": ("MiB", used / n),
+        f"First {workload.noun}, median": ("s", statistics.median(answers)),
+        f"Restore + first {workload.noun}, median": ("s", statistics.median(r + a for r, a in zip(restores, answers))),
+        "Host page faults per fork, median": ("count", statistics.median(faults)),
+        "KVM exits per fork, median": ("count", statistics.median(exits) if None not in exits else None),
+        "Copied in before resume, per fork": ("MiB", statistics.median(copied) / 2**20),
+        "Host memory per fork": ("MiB", used / n),
     }
+
+
+def report(mode, n, error, vms):
+    print(f"{mode}, {n} forks: failed: {error}", flush=True)
+    for vm in vms:
+        if vm.proc.poll() is not None or vm.dir.name in str(error):
+            print(f"  {vm.dir.name}: firecracker exit code {vm.proc.poll()}, console ends:")
+            for line in vm.log.read_text(errors="replace").splitlines()[-8:]:
+                print(f"    {line}")
+    print("  kernel log ends:")
+    for line in subprocess.run(["dmesg"], capture_output=True, text=True).stdout.splitlines()[-8:]:
+        print(f"    {line}")
+
+
+def cell(result, name, unit):
+    if result is None:
+        return "n/a"
+    return fmt(unit, result[name][1]) if result else "failed"
+
+
+def table(title, columns, results):
+    rows = next((r for r in results if r), None)
+    if rows:
+        print(f"\n| {title} | " + " | ".join(columns) + " |")
+        print("|---|" + "---|" * len(columns))
+        for name, (unit, _) in rows.items():
+            print(f"| {name} | " + " | ".join(cell(r, name, unit) for r in results) + " |")
 
 
 def configure(parser):
@@ -218,6 +307,8 @@ def configure(parser):
     parser.add_argument("--forks", default="1,8,16", help="Comma-separated numbers of forks to start at once.")
     parser.add_argument("--service", action="store_true",
                         help="Snapshot a running FastAPI app, and send it one request from each fork.")
+    parser.add_argument("--memory", default="file",
+                        help=f"Comma-separated ways to restore fork memory: {', '.join(MEMORY)}. Default: file.")
 
 
 def main(args, cache):
@@ -230,13 +321,14 @@ def main(args, cache):
     rows, disk = build_disks(task, work, workload)
     rows |= cold_path(cache, task, disk, snap, workload)
     levels = [int(n) for n in args.forks.split(",")]
-    results = {n: fork_level(cache, snap, workload, n) for n in levels}
+    modes = args.memory.split(",")
+    results = {(mode, n): fork_level(cache, snap, workload, mode, n) for mode in modes for n in levels}
 
     print(f"\n{environment(task.guest)} · task {task.name}@{TASKS_REV[:7]} · each fork sends one {workload.noun}\n")
     print("| Step | Result |\n|---|---|")
     for name, (unit, value) in rows.items():
         print(f"| {name} | {fmt(unit, value)} |")
-    print("\n| Forks started at once | " + " | ".join(str(n) for n in levels) + " |")
-    print("|---|" + "---|" * len(levels))
-    for name, (unit, _) in results[levels[0]].items():
-        print(f"| {name} | " + " | ".join(fmt(unit, results[n][name][1]) for n in levels) + " |")
+    if len(modes) == 1:
+        table("Forks started at once", [str(n) for n in levels], [results[modes[0], n] for n in levels])
+    for n in levels if len(modes) > 1 else []:
+        table(f"{n} forks at once", modes, [results[mode, n] for mode in modes])
